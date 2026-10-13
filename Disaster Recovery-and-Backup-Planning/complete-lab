@@ -1,0 +1,459 @@
+Lab 19: Disaster Recovery and Backup Planning for Red Hat Satellite 6
+Objectives
+By the end of this lab, students will be able to:
+
+Understand the importance of disaster recovery planning for Red Hat Satellite infrastructure
+Create comprehensive backups of the Satellite database and configuration files using scripted procedures
+Implement automated backup scheduling using cron
+Restore Satellite database and configuration data from backup in a controlled test environment
+Validate backup integrity and document disaster recovery procedures for operational use
+Prerequisites
+Before starting this lab, students should have:
+
+Basic understanding of Linux system administration
+Familiarity with Red Hat Satellite 6 architecture and components (Foreman, Candlepin, Pulp)
+Knowledge of PostgreSQL database concepts
+Understanding of file system operations, permissions, and shell scripting
+Access to a Satellite 6 server (or a Linux VM used to simulate one) with root or sudo access
+This lab assumes access to a Red Hat Satellite 6 server. If a live Satellite installation is not available, the backup and restore scripts can still be exercised against the local PostgreSQL instance and a set of representative configuration directories, since the scripting and recovery concepts transfer directly to a real Satellite deployment. No additional packages beyond those already present on a standard Satellite server are required. If PostgreSQL client tools are missing on a plain test VM, install them with:
+
+sudo dnf install -y postgresql postgresql-server rsync tar gzip
+Lab Environment Setup
+Ready-to-Use Cloud Machines: Al Nafi provides pre-configured Linux-based cloud machines with Red Hat Satellite 6 installed. Click Start Lab to access your environment - no need to build your own VM or install software.
+
+Your lab environment includes:
+
+A Satellite server (referred to below as satellite.example.com) with satellite-maintain, PostgreSQL, and the standard Satellite configuration directories
+Sufficient local disk space under /backup for database and configuration backups
+Root or sudo access for service management and file operations
+All commands below are run directly on the Satellite server unless stated otherwise. Replace satellite.example.com with your actual hostname if different.
+
+Task 1: Create and Schedule Satellite Backups
+Subtask 1.1: Prepare Backup Storage and Review Key Components
+Create the backup directory structure:
+sudo mkdir -p /backup/satellite/{database,config}
+sudo chmod 750 /backup/satellite
+Review the components that make up a Satellite installation, since these are what the backup scripts will protect:
+sudo ls -la /etc/foreman/
+sudo ls -la /etc/foreman-proxy/
+sudo ls -la /etc/httpd/conf.d/
+Confirm PostgreSQL is running and identify the Satellite-related databases:
+sudo systemctl status postgresql
+sudo -u postgres psql -l
+You should see postgresql reported as active (running), and the database list should include foreman (and candlepin, pulpcore on a full Satellite installation, depending on version).
+
+Subtask 1.2: Create the Database Backup Script
+Create the full script in one file so it is complete and runnable as written:
+
+sudo tee /backup/satellite/backup-database.sh > /dev/null << 'EOF'
+#!/bin/bash
+#
+# Satellite Database Backup Script
+# Creates a full PostgreSQL dump of all databases used by Satellite.
+
+set -o pipefail
+
+BACKUP_DIR="/backup/satellite/database"
+DATE=$(date +%Y%m%d_%H%M%S)
+LOG_FILE="/var/log/satellite-backup.log"
+RETENTION_DAYS=7
+
+log_message() {
+    echo "$(date '+%Y-%m-%d %H:%M:%S') - $1" | tee -a "$LOG_FILE"
+}
+
+log_message "Starting Satellite database backup"
+
+log_message "Creating PostgreSQL dump of all databases"
+sudo -u postgres pg_dumpall > "$BACKUP_DIR/satellite_db_$DATE.sql"
+
+if [ $? -eq 0 ]; then
+    log_message "Database dump completed successfully"
+    gzip "$BACKUP_DIR/satellite_db_$DATE.sql"
+    log_message "Database backup compressed to satellite_db_$DATE.sql.gz"
+else
+    log_message "ERROR: Database dump failed"
+    rm -f "$BACKUP_DIR/satellite_db_$DATE.sql"
+    exit 1
+fi
+
+log_message "Removing backups older than $RETENTION_DAYS days"
+find "$BACKUP_DIR" -name "satellite_db_*.sql.gz" -mtime +"$RETENTION_DAYS" -delete
+
+log_message "Database backup process completed"
+EOF
+Make it executable:
+
+sudo chmod +x /backup/satellite/backup-database.sh
+Note: on a production Satellite system, satellite-maintain service stop and satellite-maintain service start would normally wrap the dump to guarantee a consistent snapshot. This lab uses pg_dumpall, which produces a consistent logical dump of all databases without requiring a full service outage, making it suitable for frequent scheduled backups; a full offline backup using satellite-maintain backup is recommended before major upgrades.
+
+Subtask 1.3: Create the Configuration Backup Script
+sudo tee /backup/satellite/backup-config.sh > /dev/null << 'EOF'
+#!/bin/bash
+#
+# Satellite Configuration Backup Script
+# Archives key configuration directories used by Satellite components.
+
+BACKUP_DIR="/backup/satellite/config"
+DATE=$(date +%Y%m%d_%H%M%S)
+LOG_FILE="/var/log/satellite-backup.log"
+RETENTION_DAYS=7
+
+log_message() {
+    echo "$(date '+%Y-%m-%d %H:%M:%S') - $1" | tee -a "$LOG_FILE"
+}
+
+log_message "Starting Satellite configuration backup"
+
+tar -czf "$BACKUP_DIR/satellite_config_$DATE.tar.gz" \
+    --ignore-failed-read \
+    /etc/foreman \
+    /etc/foreman-proxy \
+    /etc/httpd/conf.d \
+    /etc/pki/katello \
+    2>>"$LOG_FILE"
+
+if [ $? -eq 0 ]; then
+    log_message "Configuration backup completed: satellite_config_$DATE.tar.gz"
+else
+    log_message "WARNING: Configuration backup completed with some files skipped (see log for details)"
+fi
+
+log_message "Removing configuration backups older than $RETENTION_DAYS days"
+find "$BACKUP_DIR" -name "satellite_config_*.tar.gz" -mtime +"$RETENTION_DAYS" -delete
+
+log_message "Configuration backup process completed"
+EOF
+sudo chmod +x /backup/satellite/backup-config.sh
+Subtask 1.4: Run the Backups and Schedule Them with Cron
+Run both scripts manually to confirm they work:
+sudo /backup/satellite/backup-database.sh
+sudo /backup/satellite/backup-config.sh
+Verify the backup files were created:
+ls -la /backup/satellite/database/
+ls -la /backup/satellite/config/
+You should see one satellite_db_<timestamp>.sql.gz file and one satellite_config_<timestamp>.tar.gz file, each with a non-zero size.
+
+Check the log file for a clean run with no ERROR entries:
+tail -20 /var/log/satellite-backup.log
+Schedule both scripts to run daily using root's crontab:
+sudo crontab -l 2>/dev/null > /tmp/current_cron
+cat >> /tmp/current_cron << 'EOF'
+# Satellite backup schedule
+0 1 * * * /backup/satellite/backup-database.sh
+30 1 * * * /backup/satellite/backup-config.sh
+EOF
+sudo crontab /tmp/current_cron
+rm -f /tmp/current_cron
+Verify the cron entries were installed:
+sudo crontab -l
+Deliverable for Task 1: A working /backup/satellite/backup-database.sh and /backup/satellite/backup-config.sh, at least one successful compressed backup file from each script under /backup/satellite/database/ and /backup/satellite/config/, a clean /var/log/satellite-backup.log with no ERROR lines, and confirmed cron entries via sudo crontab -l showing both scheduled jobs.
+
+Task 2: Design and Document Disaster Recovery Procedures
+Subtask 2.1: Write the Disaster Recovery Plan
+sudo tee /backup/satellite/disaster-recovery-plan.md > /dev/null << 'EOF'
+# Satellite Disaster Recovery Plan
+
+## Recovery Time Objective (RTO)
+- Target: 4 hours for full system recovery
+- Critical services (web UI, content delivery): 2 hours
+
+## Recovery Point Objective (RPO)
+- Maximum acceptable data loss: 24 hours
+- Database changes: up to 1 hour with more frequent backup scheduling
+
+## Recovery Procedure Phases
+
+### Phase 1: Assessment
+1. Determine the scope of the failure (database corruption, host loss, storage failure)
+2. Identify which components are affected (database, configuration, content)
+3. Estimate recovery time based on backup age and available infrastructure
+4. Notify stakeholders of the outage and expected recovery window
+
+### Phase 2: Infrastructure Preparation
+1. Provision a replacement host or VM if the original is unrecoverable
+2. Install the base operating system and apply required updates
+3. Install Satellite packages matching the original version
+4. Do not run satellite-installer until data restoration is complete
+
+### Phase 3: Data Recovery
+1. Copy the most recent database and configuration backups to the target host
+2. Restore the database using restore-database.sh
+3. Restore configuration files using restore-config.sh
+4. Verify file ownership and permissions match the expected Satellite defaults
+
+### Phase 4: Service Validation
+1. Start Satellite services with satellite-maintain service start
+2. Confirm the web UI is reachable
+3. Confirm hammer CLI and API access work correctly
+4. Spot-check that key records (organizations, hosts, content views) are present
+
+### Phase 5: Post-Recovery
+1. Update DNS records if the server's IP address has changed
+2. Notify users that service has been restored
+3. Schedule an immediate fresh backup of the recovered system
+4. Document root cause and any deviations from this plan for future improvement
+EOF
+Subtask 2.2: Create the Recovery Scripts
+Database recovery script:
+
+sudo tee /backup/satellite/restore-database.sh > /dev/null << 'EOF'
+#!/bin/bash
+#
+# Satellite Database Recovery Script
+# Usage: restore-database.sh <backup_file.sql.gz>
+
+BACKUP_DIR="/backup/satellite/database"
+LOG_FILE="/var/log/satellite-recovery.log"
+
+log_message() {
+    echo "$(date '+%Y-%m-%d %H:%M:%S') - $1" | tee -a "$LOG_FILE"
+}
+
+if [ $# -ne 1 ]; then
+    echo "Usage: $0 <backup_file>"
+    echo "Example: $0 satellite_db_20240115_010000.sql.gz"
+    exit 1
+fi
+
+BACKUP_FILE="$1"
+
+if [ ! -f "$BACKUP_DIR/$BACKUP_FILE" ]; then
+    log_message "ERROR: Backup file not found: $BACKUP_DIR/$BACKUP_FILE"
+    exit 1
+fi
+
+log_message "Starting database recovery from $BACKUP_FILE"
+log_message "WARNING: This will restore into the existing PostgreSQL cluster"
+
+gunzip -c "$BACKUP_DIR/$BACKUP_FILE" | sudo -u postgres psql -v ON_ERROR_STOP=0
+
+if [ $? -eq 0 ]; then
+    log_message "Database restoration completed"
+else
+    log_message "ERROR: Database restoration reported errors, review log output above"
+    exit 1
+fi
+
+log_message "Database recovery process finished"
+EOF
+sudo chmod +x /backup/satellite/restore-database.sh
+Configuration recovery script:
+
+sudo tee /backup/satellite/restore-config.sh > /dev/null << 'EOF'
+#!/bin/bash
+#
+# Satellite Configuration Recovery Script
+# Usage: restore-config.sh <backup_file.tar.gz>
+
+BACKUP_DIR="/backup/satellite/config"
+LOG_FILE="/var/log/satellite-recovery.log"
+
+log_message() {
+    echo "$(date '+%Y-%m-%d %H:%M:%S') - $1" | tee -a "$LOG_FILE"
+}
+
+if [ $# -ne 1 ]; then
+    echo "Usage: $0 <backup_file>"
+    echo "Example: $0 satellite_config_20240115_013000.tar.gz"
+    exit 1
+fi
+
+BACKUP_FILE="$1"
+
+if [ ! -f "$BACKUP_DIR/$BACKUP_FILE" ]; then
+    log_message "ERROR: Backup file not found: $BACKUP_DIR/$BACKUP_FILE"
+    exit 1
+fi
+
+log_message "Backing up current configuration before overwrite"
+mkdir -p /tmp/config-pre-restore
+tar -czf "/tmp/config-pre-restore/pre_restore_$(date +%Y%m%d_%H%M%S).tar.gz" \
+    /etc/foreman /etc/foreman-proxy /etc/httpd/conf.d 2>/dev/null
+
+log_message "Restoring configuration files from $BACKUP_FILE"
+tar -xzf "$BACKUP_DIR/$BACKUP_FILE" -C /
+
+if [ $? -eq 0 ]; then
+    log_message "Configuration files restored successfully"
+else
+    log_message "ERROR: Configuration restoration failed"
+    exit 1
+fi
+
+log_message "Configuration recovery process finished"
+EOF
+sudo chmod +x /backup/satellite/restore-config.sh
+Deliverable for Task 2: A completed /backup/satellite/disaster-recovery-plan.md document covering all five recovery phases, plus working, executable restore-database.sh and restore-config.sh scripts saved under /backup/satellite/.
+
+Task 3: Test the Recovery Process and Validate Backup Integrity
+Subtask 3.1: Test Database Restoration in an Isolated Database
+Rather than overwriting the live Satellite database, restore into a separate test database to safely validate that the backup is usable.
+
+sudo tee /backup/satellite/test-db-restore.sh > /dev/null << 'EOF'
+#!/bin/bash
+#
+# Test Database Restoration Script
+# Restores the latest backup into a throwaway database for validation only.
+
+BACKUP_DIR="/backup/satellite/database"
+LOG_FILE="/var/log/satellite-recovery.log"
+TEST_DB="satellite_restore_test"
+
+log_message() {
+    echo "$(date '+%Y-%m-%d %H:%M:%S') - $1" | tee -a "$LOG_FILE"
+}
+
+LATEST_BACKUP=$(ls -t "$BACKUP_DIR"/satellite_db_*.sql.gz 2>/dev/null | head -1)
+
+if [ -z "$LATEST_BACKUP" ]; then
+    log_message "ERROR: No database backup found in $BACKUP_DIR"
+    exit 1
+fi
+
+log_message "Testing restoration using $(basename "$LATEST_BACKUP")"
+
+sudo -u postgres dropdb --if-exists "$TEST_DB"
+sudo -u postgres createdb "$TEST_DB"
+
+gunzip -c "$LATEST_BACKUP" | sudo -u postgres psql -v ON_ERROR_STOP=0 -d "$TEST_DB" > /tmp/test_restore_output.log 2>&1
+
+TABLE_COUNT=$(sudo -u postgres psql -d "$TEST_DB" -t -c \
+    "SELECT count(*) FROM information_schema.tables WHERE table_schema='public';" | tr -d '[:space:]')
+
+if [ -n "$TABLE_COUNT" ] && [ "$TABLE_COUNT" -gt 0 ]; then
+    log_message "Database restoration test SUCCESSFUL: $TABLE_COUNT tables found in $TEST_DB"
+else
+    log_message "ERROR: Database restoration test FAILED: no tables found"
+    sudo -u postgres dropdb --if-exists "$TEST_DB"
+    exit 1
+fi
+
+sudo -u postgres dropdb --if-exists "$TEST_DB"
+log_message "Test database cleaned up"
+log_message "Database restoration test completed"
+EOF
+sudo chmod +x /backup/satellite/test-db-restore.sh
+sudo /backup/satellite/test-db-restore.sh
+Expected result: the log reports Database restoration test SUCCESSFUL with a table count greater than zero, and the temporary test database is removed afterward.
+
+Subtask 3.2: Test Configuration Restoration into a Scratch Directory
+sudo tee /backup/satellite/test-config-restore.sh > /dev/null << 'EOF'
+#!/bin/bash
+#
+# Test Configuration Restoration Script
+# Extracts the latest configuration backup into a scratch directory for inspection.
+
+BACKUP_DIR="/backup/satellite/config"
+LOG_FILE="/var/log/satellite-recovery.log"
+TEST_DIR="/tmp/config-restore-test"
+
+log_message() {
+    echo "$(date '+%Y-%m-%d %H:%M:%S') - $1" | tee -a "$LOG_FILE"
+}
+
+LATEST_CONFIG=$(ls -t "$BACKUP_DIR"/satellite_config_*.tar.gz 2>/dev/null | head -1)
+
+if [ -z "$LATEST_CONFIG" ]; then
+    log_message "ERROR: No configuration backup found in $BACKUP_DIR"
+    exit 1
+fi
+
+log_message "Testing configuration restoration using $(basename "$LATEST_CONFIG")"
+
+rm -rf "$TEST_DIR"
+mkdir -p "$TEST_DIR"
+tar -xzf "$LATEST_CONFIG" -C "$TEST_DIR"
+
+if [ $? -eq 0 ]; then
+    FILE_COUNT=$(find "$TEST_DIR" -type f | wc -l)
+    log_message "Configuration extraction test SUCCESSFUL: $FILE_COUNT files extracted"
+
+    if [ -d "$TEST_DIR/etc/foreman" ]; then
+        log_message "Verified: Foreman configuration directory present in backup"
+    else
+        log_message "WARNING: Foreman configuration directory missing from backup"
+    fi
+else
+    log_message "ERROR: Configuration extraction test FAILED"
+    rm -rf "$TEST_DIR"
+    exit 1
+fi
+
+rm -rf "$TEST_DIR"
+log_message "Test directory cleaned up"
+log_message "Configuration restoration test completed"
+EOF
+sudo chmod +x /backup/satellite/test-config-restore.sh
+sudo /backup/satellite/test-config-restore.sh
+Expected result: the log reports Configuration extraction test SUCCESSFUL with a non-zero file count, and confirms that the Foreman configuration directory was present in the archive.
+
+Subtask 3.3: Generate a Recovery Test Report
+sudo tee /backup/satellite/generate-test-report.sh > /dev/null << 'EOF'
+#!/bin/bash
+#
+# Recovery Test Report Generator
+
+REPORT_FILE="/backup/satellite/disaster-recovery-test-report.txt"
+LOG_FILE="/var/log/satellite-recovery.log"
+
+DB_RESULT="FAILED"
+CONFIG_RESULT="FAILED"
+
+grep -q "Database restoration test SUCCESSFUL" "$LOG_FILE" && DB_RESULT="PASSED"
+grep -q "Configuration extraction test SUCCESSFUL" "$LOG_FILE" && CONFIG_RESULT="PASSED"
+
+cat > "$REPORT_FILE" << REPORT
+SATELLITE DISASTER RECOVERY TEST REPORT
+Generated: $(date)
+Host: $(hostname)
+
+=== TEST SUMMARY ===
+Database Restoration Test: $DB_RESULT
+Configuration Restoration Test: $CONFIG_RESULT
+
+=== BACKUP INVENTORY ===
+Database backups:
+$(ls -la /backup/satellite/database/ 2>/dev/null)
+
+Configuration backups:
+$(ls -la /backup/satellite/config/ 2>/dev/null)
+
+=== RECENT RECOVERY LOG ENTRIES ===
+$(tail -20 "$LOG_FILE" 2>/dev/null)
+
+=== RECOMMENDATIONS ===
+1. Continue running restoration tests on a regular schedule, not just after backup changes
+2. Keep at least 7 days of database backups and 7 days of configuration backups
+3. Store a copy of backups on separate storage or a remote host, not only local disk
+4. Re-run this test report after any change to backup script logic
+
+Report generated: $(date)
+REPORT
+
+echo "Report written to $REPORT_FILE"
+cat "$REPORT_FILE"
+EOF
+sudo chmod +x /backup/satellite/generate-test-report.sh
+sudo /backup/satellite/generate-test-report.sh
+Deliverable for Task 3: A /backup/satellite/disaster-recovery-test-report.txt file showing PASSED for both the database and configuration restoration tests, generated from a real run of test-db-restore.sh and test-config-restore.sh against your actual backup files.
+
+Expected Outcomes
+A working, scheduled backup system for Satellite's database and configuration files, with verified output files and clean logs
+A documented, phase-based disaster recovery plan alongside working restore scripts for both database and configuration data
+A passing disaster recovery test report demonstrating that current backups can be restored and validated without impacting the production database
+Troubleshooting
+Issue: backup-database.sh fails with a permission denied error when writing to /backup/satellite/database/. Diagnostic hint: Check the ownership and mode of the backup directory with ls -ld /backup/satellite/database and confirm the script is being run with sufficient privileges (root or a user in the postgres group) to both read the database and write to that path.
+
+Issue: test-db-restore.sh reports zero tables restored even though the script exits without an error. Diagnostic hint: Inspect /tmp/test_restore_output.log for psql errors that may have been suppressed by ON_ERROR_STOP=0; a dump created against a different PostgreSQL major version or a truncated .sql.gz file are common causes.
+
+Conclusion
+In this lab, you built a complete, working backup and disaster recovery workflow for Red Hat Satellite 6, covering database dumps, configuration archiving, scheduled execution via cron, and documented recovery procedures. You then proved the value of that workflow by restoring both the database and configuration backups into isolated test locations, confirming that the backups were not just present but actually usable, and captured the results in a repeatable test report. Along the way you:
+
+Created robust backup scripts for the Satellite database and configuration files, with logging, compression, and retention cleanup built in
+Automated backup scheduling using cron so backups run consistently without manual intervention
+Documented a phased disaster recovery plan with clear recovery time and recovery point objectives
+Built working restore scripts for both the database and configuration data
+Tested backup and recovery processes in a controlled environment to validate their effectiveness
+Documented comprehensive disaster recovery procedures for operational use
+This comprehensive disaster recovery plan ensures that Red Hat Satellite 6 can be restored quickly and reliably in the event of a disaster, minimizing downtime and data loss.
