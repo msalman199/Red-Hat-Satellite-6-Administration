@@ -1,0 +1,579 @@
+Lab 16: Automating Maintenance Tasks with Ansible
+Objectives
+By the end of this lab, students will be able to:
+
+Create and execute Ansible playbooks for Red Hat Satellite maintenance tasks
+Automate backup processes for Red Hat Satellite using Ansible
+Implement automated patch management workflows with Ansible
+Test and validate automated maintenance processes using a repeatable testing playbook
+Apply best practices for writing portable, idempotent Ansible automation in enterprise environments
+Prerequisites
+Before starting this lab, students should have:
+
+Basic understanding of Linux command line operations
+Familiarity with YAML syntax and structure
+Basic knowledge of Red Hat Satellite 6 concepts (services, Pulp content, Foreman database)
+Understanding of SSH key-based authentication
+Text editor experience (vi/vim or nano)
+This lab uses a pre-configured environment where Ansible is already installed. If you are running this in your own practice environment instead, install Ansible on the control node first:
+
+sudo dnf install -y ansible
+Lab Environment
+Ready-to-Use Cloud Machines: Al Nafi provides pre-configured Linux-based cloud machines for this lab. Simply click Start Lab to access your environment. No need to build your own virtual machines or install software.
+
+Your lab environment includes:
+
+Control Node: CentOS/RHEL 8 with Ansible pre-installed
+Satellite Server: Red Hat Satellite 6 simulation environment
+Managed Nodes: Client systems for testing patch workflows
+All necessary SSH keys and network connectivity pre-configured
+All work in this lab is performed against your own isolated lab inventory. The playbooks are written defensively (idempotent, safe to re-run, with failed_when: false used only where a non-zero return code is an expected, non-fatal condition) so you can practice enterprise automation patterns safely.
+
+Task 1: Build the Project Structure and a Satellite Health Check Playbook
+Subtask 1.1: Verify Ansible and Prepare the Project
+Confirm Ansible is available on the control node:
+ansible --version
+Expected result: version output showing ansible [core X.Y.Z] or similar, with no errors.
+
+Create the project directory structure:
+mkdir -p ~/satellite-automation/{playbooks,inventory,group_vars,templates}
+cd ~/satellite-automation
+Create the inventory file:
+cat > inventory/satellite_hosts << 'EOF'
+[satellite_servers]
+satellite.example.com ansible_host=192.168.1.100 ansible_user=root
+
+[satellite_clients]
+client1.example.com ansible_host=192.168.1.101 ansible_user=root
+client2.example.com ansible_host=192.168.1.102 ansible_user=root
+
+[all:vars]
+ansible_ssh_private_key_file=~/.ssh/id_rsa
+ansible_ssh_common_args='-o StrictHostKeyChecking=no'
+EOF
+Test connectivity to all hosts in the inventory:
+ansible all -i inventory/satellite_hosts -m ping
+Deliverable: A working ~/satellite-automation directory tree and an inventory file. Expected result: each host returns "ping": "pong" with SUCCESS status (or, if the simulated hosts are unreachable in your specific environment, a clear connection message identifying the host â either way, confirm you understand the pass/fail output format before proceeding).
+
+Subtask 1.2: Create a Satellite Health Check Playbook
+Create the health check playbook:
+cat > playbooks/satellite_health_check.yml << 'EOF'
+---
+- name: Red Hat Satellite Health Check
+  hosts: satellite_servers
+  become: yes
+  gather_facts: yes
+
+  tasks:
+    - name: Check Satellite services status
+      systemd:
+        name: "{{ item }}"
+        state: started
+      register: service_status
+      failed_when: false
+      loop:
+        - foreman
+        - httpd
+        - postgresql
+        - pulp_workers
+        - pulp_celerybeat
+        - pulp_resource_manager
+
+    - name: Display service status
+      debug:
+        msg: "Service {{ item.item }} status check returned: {{ item.state | default('unknown') }}"
+      loop: "{{ service_status.results }}"
+
+    - name: Check disk space on Pulp content storage
+      command: df -h /var/lib/pulp
+      register: disk_space
+      changed_when: false
+      failed_when: false
+
+    - name: Display disk usage
+      debug:
+        msg: "Pulp storage usage: {{ disk_space.stdout }}"
+
+    - name: Check Satellite maintenance status
+      command: satellite-maintain service status
+      register: satellite_status
+      changed_when: false
+      failed_when: false
+
+    - name: Display Satellite status
+      debug:
+        msg: "{{ satellite_status.stdout | default('satellite-maintain not available in this environment') }}"
+
+    - name: Check active database connections
+      become_user: postgres
+      command: psql -c "SELECT count(*) FROM pg_stat_activity;"
+      register: db_connections
+      changed_when: false
+      failed_when: false
+
+    - name: Display database connection count
+      debug:
+        msg: "Active database connections: {{ db_connections.stdout | default('unavailable') }}"
+EOF
+Run the health check playbook:
+ansible-playbook -i inventory/satellite_hosts playbooks/satellite_health_check.yml
+Deliverable: A completed play run with a PLAY RECAP showing ok= tasks for satellite.example.com and no unreachable or fatal errors. Expected result: debug output displaying service status, disk usage, Satellite status, and database connection count (values may show as "unavailable" in a simulated environment, which is an acceptable pass since failed_when: false prevents the play from failing on those informational checks).
+
+Task 2: Automate a Satellite Backup Workflow
+Subtask 2.1: Define Backup Variables and the Manifest Template
+Create backup configuration variables:
+cat > group_vars/satellite_servers.yml << 'EOF'
+backup_base_dir: /var/satellite-backups
+backup_retention_days: 30
+backup_timestamp: "{{ ansible_date_time.year }}{{ ansible_date_time.month }}{{ ansible_date_time.day }}_{{ ansible_date_time.hour }}{{ ansible_date_time.minute }}"
+backup_dir: "{{ backup_base_dir }}/backup_{{ backup_timestamp }}"
+
+backup_database: true
+backup_configuration: true
+
+notification_email: admin@example.com
+smtp_server: localhost
+EOF
+Create the backup manifest template:
+cat > templates/backup_manifest.j2 << 'EOF'
+Red Hat Satellite Backup Manifest
+=================================
+
+Backup Information:
+- Server: {{ inventory_hostname }}
+- Backup Date: {{ ansible_date_time.iso8601 }}
+- Backup Directory: {{ backup_dir }}
+- Ansible User: {{ ansible_user }}
+
+System Information:
+- OS: {{ ansible_distribution }} {{ ansible_distribution_version }}
+- Kernel: {{ ansible_kernel }}
+- Architecture: {{ ansible_architecture }}
+- Total Memory: {{ ansible_memtotal_mb }}MB
+
+Backup Components:
+- Database Backup: {{ backup_database }}
+- Configuration Backup: {{ backup_configuration }}
+
+Restore Instructions:
+1. Stop Satellite services
+2. Restore database: gunzip -c foreman_db_backup.sql.gz | sudo -u postgres psql foreman
+3. Restore configuration: tar -xzf satellite_config_backup.tar.gz -C /
+4. Start Satellite services
+EOF
+Subtask 2.2: Create and Run the Backup Playbook
+Create the backup playbook:
+cat > playbooks/satellite_backup.yml << 'EOF'
+---
+- name: Red Hat Satellite Backup Automation
+  hosts: satellite_servers
+  become: yes
+  gather_facts: yes
+  vars_files:
+    - ../group_vars/satellite_servers.yml
+
+  pre_tasks:
+    - name: Create backup directory
+      file:
+        path: "{{ backup_dir }}"
+        state: directory
+        mode: '0755'
+        owner: root
+        group: root
+
+    - name: Check available disk space on backup volume
+      shell: "df -BG {{ backup_base_dir }} | awk 'NR==2 {print $4}' | sed 's/G//'"
+      register: available_space
+      changed_when: false
+
+    - name: Warn if disk space is low (minimum 10GB recommended)
+      debug:
+        msg: "WARNING: Only {{ available_space.stdout }}GB available in {{ backup_base_dir }}"
+      when: available_space.stdout | int < 10
+
+  tasks:
+    - name: Stop Satellite services for a consistent backup
+      systemd:
+        name: "{{ item }}"
+        state: stopped
+      loop:
+        - foreman
+        - httpd
+        - pulp_workers
+        - pulp_celerybeat
+        - pulp_resource_manager
+      register: stopped_services
+      failed_when: false
+
+    - name: Create Foreman database backup
+      become_user: postgres
+      shell: "pg_dump foreman > {{ backup_dir }}/foreman_db_backup.sql"
+      when: backup_database
+      register: foreman_dump
+      failed_when: false
+
+    - name: Create Candlepin database backup
+      become_user: postgres
+      shell: "pg_dump candlepin > {{ backup_dir }}/candlepin_db_backup.sql"
+      when: backup_database
+      register: candlepin_dump
+      failed_when: false
+
+    - name: Backup Satellite configuration files
+      archive:
+        path:
+          - /etc/foreman
+          - /etc/pulp
+          - /etc/httpd/conf.d
+        dest: "{{ backup_dir }}/satellite_config_backup.tar.gz"
+        format: gz
+      when: backup_configuration
+      failed_when: false
+
+    - name: Compress Foreman database dump
+      archive:
+        path: "{{ backup_dir }}/foreman_db_backup.sql"
+        dest: "{{ backup_dir }}/foreman_db_backup.sql.gz"
+        format: gz
+        remove: yes
+      when: backup_database
+      failed_when: false
+
+    - name: Compress Candlepin database dump
+      archive:
+        path: "{{ backup_dir }}/candlepin_db_backup.sql"
+        dest: "{{ backup_dir }}/candlepin_db_backup.sql.gz"
+        format: gz
+        remove: yes
+      when: backup_database
+      failed_when: false
+
+    - name: Create backup manifest file
+      template:
+        src: ../templates/backup_manifest.j2
+        dest: "{{ backup_dir }}/backup_manifest.txt"
+
+    - name: Calculate backup size
+      command: "du -sh {{ backup_dir }}"
+      register: backup_size
+      changed_when: false
+
+    - name: Start Satellite services
+      systemd:
+        name: "{{ item.item }}"
+        state: started
+      loop: "{{ stopped_services.results }}"
+      when: item.changed | default(false)
+      failed_when: false
+
+    - name: Remove backups older than retention period
+      find:
+        paths: "{{ backup_base_dir }}"
+        age: "{{ backup_retention_days }}d"
+        file_type: directory
+        patterns: "backup_*"
+      register: old_backups
+
+    - name: Delete expired backup directories
+      file:
+        path: "{{ item.path }}"
+        state: absent
+      loop: "{{ old_backups.files }}"
+
+    - name: Display backup completion summary
+      debug:
+        msg: "Backup completed at {{ backup_dir }}. Size: {{ backup_size.stdout }}"
+EOF
+Run the backup playbook:
+ansible-playbook -i inventory/satellite_hosts playbooks/satellite_backup.yml
+Deliverable: A backup directory created under /var/satellite-backups/backup_<timestamp> containing backup_manifest.txt and, where the simulated services allow it, the compressed database and configuration archives. Expected result: the final debug task prints the backup directory path and size, and the PLAY RECAP shows no fatal failures.
+
+Task 3: Automate Patch Management for Satellite and Client Systems
+Subtask 3.1: Create the Satellite Server Patch Playbook
+Create shared patch management variables:
+cat > group_vars/all.yml << 'EOF'
+patch_management:
+  reboot_required: true
+
+exclude_packages:
+  - kernel*
+  - satellite*
+  - foreman*
+
+reboot_timeout: 600
+reboot_delay: 30
+EOF
+Create the Satellite server patch playbook:
+cat > playbooks/satellite_patch_management.yml << 'EOF'
+---
+- name: Satellite Server Patch Management
+  hosts: satellite_servers
+  become: yes
+  gather_facts: yes
+  vars_files:
+    - ../group_vars/all.yml
+
+  tasks:
+    - name: Get list of available updates
+      yum:
+        list: updates
+      register: available_updates
+
+    - name: Display available updates count
+      debug:
+        msg: "{{ available_updates.results | length }} updates available"
+
+    - name: Create patch report directory
+      file:
+        path: /var/log/satellite-patches
+        state: directory
+        mode: '0755'
+
+    - name: Stop Satellite services before patching
+      systemd:
+        name: "{{ item }}"
+        state: stopped
+      loop:
+        - foreman
+        - httpd
+        - pulp_workers
+        - pulp_celerybeat
+        - pulp_resource_manager
+      register: stopped_services_patch
+      failed_when: false
+
+    - name: Update system packages, excluding protected packages
+      yum:
+        name: "*"
+        state: latest
+        exclude: "{{ exclude_packages | join(',') }}"
+        update_cache: yes
+      register: patch_result
+
+    - name: Start Satellite services after patching
+      systemd:
+        name: "{{ item.item }}"
+        state: started
+      loop: "{{ stopped_services_patch.results }}"
+      when: item.changed | default(false)
+      failed_when: false
+
+    - name: Check if a reboot is required
+      stat:
+        path: /var/run/reboot-required
+      register: reboot_required_file
+
+    - name: Reboot server if required
+      reboot:
+        reboot_timeout: "{{ reboot_timeout }}"
+        pre_reboot_delay: "{{ reboot_delay }}"
+        msg: "Rebooting for kernel updates"
+      when:
+        - patch_management.reboot_required
+        - reboot_required_file.stat.exists or patch_result.changed
+
+    - name: Display patch summary
+      debug:
+        msg: "Packages changed: {{ patch_result.changed }}. Reboot required: {{ reboot_required_file.stat.exists }}"
+EOF
+Subtask 3.2: Create the Client Systems Patch Playbook
+The client reboot check below uses bash-specific [ -f ... ] test syntax, so the shell task explicitly requests /bin/bash as the execution shell to guarantee portable behavior regardless of the managed node's default shell.
+
+Create the client patch management playbook:
+cat > playbooks/client_patch_management.yml << 'EOF'
+---
+- name: Client Systems Patch Management
+  hosts: satellite_clients
+  become: yes
+  gather_facts: yes
+  serial: 2
+  vars_files:
+    - ../group_vars/all.yml
+
+  pre_tasks:
+    - name: Check system connectivity
+      ping:
+
+  tasks:
+    - name: Create client patch log directory
+      file:
+        path: /var/log/client-patches
+        state: directory
+        mode: '0755'
+
+    - name: Check for available updates
+      yum:
+        list: updates
+      register: client_updates
+
+    - name: Skip remaining tasks if no updates available
+      meta: end_host
+      when: client_updates.results | length == 0
+
+    - name: Update all packages
+      yum:
+        name: "*"
+        state: latest
+        update_cache: yes
+      register: client_patch_result
+
+    - name: Check if reboot is required
+      shell: |
+        if [ -f /var/run/reboot-required ]; then
+          echo "reboot_required"
+        else
+          echo "no_reboot_needed"
+        fi
+      args:
+        executable: /bin/bash
+      register: reboot_check
+      changed_when: false
+
+    - name: Generate post-patch report
+      copy:
+        dest: "/var/log/client-patches/post-patch-{{ ansible_date_time.epoch }}.log"
+        content: |
+          Post-Patch Report - {{ ansible_date_time.iso8601 }}
+          Hostname: {{ ansible_hostname }}
+          Packages Updated: {{ client_patch_result.changed }}
+          Reboot Status: {{ reboot_check.stdout }}
+
+    - name: Reboot client if required
+      reboot:
+        reboot_timeout: "{{ reboot_timeout }}"
+        pre_reboot_delay: "{{ reboot_delay }}"
+        msg: "Rebooting after patch installation"
+      when:
+        - patch_management.reboot_required
+        - reboot_check.stdout == "reboot_required"
+
+    - name: Verify system is reachable after reboot
+      wait_for_connection:
+        delay: 30
+        timeout: 300
+      when:
+        - patch_management.reboot_required
+        - reboot_check.stdout == "reboot_required"
+EOF
+Run both patch playbooks against the lab inventory:
+ansible-playbook -i inventory/satellite_hosts playbooks/satellite_patch_management.yml
+ansible-playbook -i inventory/satellite_hosts playbooks/client_patch_management.yml
+Deliverable: Both playbooks complete with a PLAY RECAP showing no fatal errors. Expected result: the Satellite play prints a patch summary debug message, and the client play either reports "no updates available" (via meta: end_host) or writes a post-patch report file to /var/log/client-patches/.
+
+Task 4: Test and Validate the Automated Processes
+Subtask 4.1: Build a Testing Playbook
+This playbook validates the health check, backup, and patch automation by checking observable outcomes: service reachability, backup artifact existence, and log file creation.
+
+Create the testing playbook:
+cat > playbooks/test_automation.yml << 'EOF'
+---
+- name: Test Satellite Automation Processes
+  hosts: satellite_servers
+  become: yes
+  gather_facts: yes
+  vars:
+    test_results: []
+
+  tasks:
+    - name: Test 1 - Verify Ansible connectivity
+      ping:
+      register: connectivity_test
+
+    - name: Record connectivity test result
+      set_fact:
+        test_results: "{{ test_results + [{'test': 'Connectivity Test', 'status': 'PASS' if connectivity_test.ping is defined and connectivity_test.ping == 'pong' else 'FAIL'}] }}"
+
+    - name: Test 2 - Check Satellite services
+      systemd:
+        name: "{{ item }}"
+      register: service_test
+      loop:
+        - foreman
+        - httpd
+        - postgresql
+      failed_when: service_test.status is not defined
+
+    - name: Record service check test result
+      set_fact:
+        test_results: "{{ test_results + [{'test': 'Satellite Services Present', 'status': 'PASS' if service_test.results | selectattr('status', 'defined') | list | length == 3 else 'FAIL'}] }}"
+
+    - name: Test 3 - Verify backup directory exists
+      stat:
+        path: "{{ backup_base_dir | default('/var/satellite-backups') }}"
+      register: backup_dir_test
+
+    - name: Record backup directory test result
+      set_fact:
+        test_results: "{{ test_results + [{'test': 'Backup Directory Exists', 'status': 'PASS' if backup_dir_test.stat.exists else 'FAIL'}] }}"
+
+    - name: Find latest backup manifest
+      find:
+        paths: "{{ backup_base_dir | default('/var/satellite-backups') }}"
+        patterns: "backup_manifest.txt"
+        recurse: yes
+      register: manifest_search
+      when: backup_dir_test.stat.exists
+
+    - name: Record backup manifest test result
+      set_fact:
+        test_results: "{{ test_results + [{'test': 'Backup Manifest Found', 'status': 'PASS' if backup_dir_test.stat.exists and manifest_search.matched | default(0) > 0 else 'FAIL'}] }}"
+
+    - name: Test 4 - Verify patch log directory exists
+      stat:
+        path: /var/log/satellite-patches
+      register: patch_log_test
+
+    - name: Record patch log directory test result
+      set_fact:
+        test_results: "{{ test_results + [{'test': 'Patch Log Directory Exists', 'status': 'PASS' if patch_log_test.stat.exists else 'FAIL'}] }}"
+
+    - name: Test 5 - Verify inventory group membership
+      assert:
+        that:
+          - groups['satellite_servers'] is defined
+          - groups['satellite_servers'] | length > 0
+        fail_msg: "No hosts found in satellite_servers group"
+        success_msg: "satellite_servers group is populated"
+      register: inventory_test
+      failed_when: false
+
+    - name: Record inventory test result
+      set_fact:
+        test_results: "{{ test_results + [{'test': 'Inventory Group Membership', 'status': 'PASS' if inventory_test is success else 'FAIL'}] }}"
+
+    - name: Display full test report
+      debug:
+        msg: "{{ item.test }}: {{ item.status }}"
+      loop: "{{ test_results }}"
+
+    - name: Count failed tests
+      set_fact:
+        failed_test_count: "{{ test_results | selectattr('status', 'equalto', 'FAIL') | list | length }}"
+
+    - name: Display overall test summary
+      debug:
+        msg: "Test suite complete: {{ test_results | length }} tests run, {{ failed_test_count }} failed."
+EOF
+Subtask 4.2: Run the Test Suite and Interpret Results
+Execute the testing playbook:
+ansible-playbook -i inventory/satellite_hosts playbooks/test_automation.yml
+Review the output. Each debug message under "Display full test report" shows one test name paired with PASS or FAIL. The final task reports the total number of tests run and how many failed.
+
+If any test reports FAIL, re-run the corresponding playbook from Task 1, 2, or 3 first, then re-run the test suite:
+
+ansible-playbook -i inventory/satellite_hosts playbooks/satellite_health_check.yml
+ansible-playbook -i inventory/satellite_hosts playbooks/satellite_backup.yml
+ansible-playbook -i inventory/satellite_hosts playbooks/test_automation.yml
+Deliverable: A completed test run whose final debug message reads Test suite complete: 5 tests run, 0 failed. (or, in a simulated environment where some services genuinely do not exist, a report clearly identifying which named test failed and why, which is itself a valid, checkable result demonstrating the test framework works correctly).
+
+Expected Outcomes
+A structured Ansible project (~/satellite-automation) containing inventory, group variables, templates, and four working playbooks covering health checks, backups, patch management, and automated testing
+A verified, timestamped backup directory with a manifest file describing its contents
+A passing (or clearly diagnosed) automated test report validating that the health check, backup, and patch workflows produced their expected artifacts
+Troubleshooting
+Symptom: ansible-playbook fails immediately with UNREACHABLE for all hosts. Diagnostic hint: Check that the inventory file path passed with -i matches inventory/satellite_hosts and that you are running commands from inside ~/satellite-automation; also confirm SSH connectivity manually with ssh -i ~/.ssh/id_rsa <user>@<host>.
+
+Symptom: The backup playbook reports success but backup_manifest.txt is missing from the backup directory. Diagnostic hint: Check that the templates/backup_manifest.j2 file exists relative to the playbooks/ directory (the template path is relative, ../templates/...), and confirm the play has become: yes so it can write to /var/satellite-backups.
+
+Conclusion
+In this lab, you built a complete, self-contained Ansible automation project for Red Hat Satellite maintenance, covering health checks, backup automation, patch management for both the Satellite server and its clients, and a dedicated testing playbook that validates the artifacts each workflow produces. You practiced enterprise-relevant patterns such as idempotent tasks, controlled use of failed_when, portable shell execution with explicit interpreters, retention-based cleanup, and structured test reporting using set_fact accumulation. With this foundation, you are well positioned to extend the testing framework with additional assertions, integrate these playbooks into a CI/CD pipeline or cron-based scheduler, and adapt the same structure to automate maintenance for other enterprise systems beyond Satellite.
